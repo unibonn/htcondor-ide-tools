@@ -1,0 +1,73 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import argparse
+import htcondor
+
+
+JOB_TYPE_NAME = 'EditorJob'
+# submit jobs as 'vscode-something'
+# check if a job with this name is already running (best case: check on all submit nodes)
+
+def prepare_job(args):
+    """
+    Read in jdl file provided by user and translate it into a Submit object.
+    Also append settings we need for VSCode interactive editing jobs.
+    """
+    # read jdl file
+    test_f = None
+    filename = args.file
+    if not os.path.isfile(filename):
+        print('This cannot be! Where is my file?!')
+        sys.exit("Job file not found, exiting...")
+    with open(filename, 'r') as f:
+        test_f = f.read()
+
+    # convert to Submit object
+    sub = htcondor.Submit(test_f)
+    sub[JOB_TYPE_NAME] = True
+    # TODO: possibly improve naming
+    sub['batch-name'] = 'vscode-%s' % (filename.strip('.jdl').replace('/', '-'))
+    return sub
+
+
+def check_running_jobs(job_name, schedd):
+    # query local schedd for the needed ClassAds
+    query = schedd.query(projection=["JobBatchName", JOB_TYPE_NAME])
+    job_name_found = False
+    job_type_found = False
+    for job in query:
+        # check if job_name already exists for running jobs
+        if "JobBatchName" in job.keys():
+            job_name_found = True if job_name == job.lookup("JobBatchName") else False
+        if JOB_TYPE_NAME in job.keys():
+            job_type_found = True if job.lookup(JOB_TYPE_NAME) is True else False
+        if job_name_found and job_type_found:
+            return True
+    return False
+
+
+def submit_job(sub):
+    schedd = htcondor.Schedd()
+    job_name = sub['batch-name']
+    job_name = 'Rocky9_interactive'
+    # check if a job with this name is already running
+    job_is_running = check_running_jobs(job_name, schedd)
+    # submit job
+    if job_is_running is True:
+        print('You already have a job running. We will not submit a new but rather connect to the existing job.')
+    else:
+        print('Submitting job...')
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f", "--file", required=True, help = "Path to jdl file")
+
+    args = parser.parse_args()
+
+    # get Submit object
+    sub = prepare_job(args)
+    # submit job
+    submit_job(sub)
+
