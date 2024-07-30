@@ -190,7 +190,7 @@ def wrap_input(proc, stdin):
             print("condor_ssh_to_job exited, terminating input wrapper...")
             return
         # Use "select" to cheaply wait for new input, then read1 which only blocks until some bytes are there.
-        stuffthere, _, _ = select.select([stdin], [], [], 0.1)
+        stuffthere, _, _ = select.select([stdin], [], [], 1)
         if stuffthere:
             iput = stdin.buffer.read1()
             # If select and read1 returned but 0 bytes are there, EOF was hit.
@@ -213,7 +213,7 @@ def wrap_output(proc, stdout):
             print("condor_ssh_to_job exited, terminating output wrapper...")
             return
         # Use "select" to cheaply wait for new output, then read1 which only blocks until some bytes are there.
-        stuffthere, _, _ = select.select([proc.stdout], [], [], 0.1)
+        stuffthere, _, _ = select.select([proc.stdout], [], [], 1)
         if stuffthere:
             purge_oput = False
             oput = proc.stdout.read1()
@@ -270,5 +270,5 @@ if __name__ == "__main__":
 
     # Block until process is terminated, then pass through exit code.
     while proc.poll() is None:
-         time.sleep(0.1)
+         time.sleep(1)
     sys.exit(proc.returncode)
