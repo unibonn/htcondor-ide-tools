@@ -2,72 +2,268 @@
 
 import os
 import sys
+import time
 import argparse
+import subprocess
+import threading
+import select
 import htcondor
 
-
 JOB_TYPE_NAME = 'EditorJob'
+JOB_PREFIX = 'vscode'
 # submit jobs as 'vscode-something'
 # check if a job with this name is already running (best case: check on all submit nodes)
 
-def prepare_job(args):
+def prepare_job(jdl_file):
     """
     Read in jdl file provided by user and translate it into a Submit object.
     Also append settings we need for VSCode interactive editing jobs.
     """
     # read jdl file
     test_f = None
-    filename = args.file
-    if not os.path.isfile(filename):
+    if not os.path.isfile(jdl_file):
         print('This cannot be! Where is my file?!')
-        sys.exit("Job file not found, exiting...")
-    with open(filename, 'r') as f:
+        sys.exit(f"Job file {jdl_file} not found, exiting...")
+    with open(jdl_file, 'r') as f:
         test_f = f.read()
 
     # convert to Submit object
     sub = htcondor.Submit(test_f)
-    sub[JOB_TYPE_NAME] = True
-    # TODO: possibly improve naming
-    sub['batch-name'] = 'vscode-%s' % (filename.strip('.jdl').replace('/', '-'))
+    sub[f"+{JOB_TYPE_NAME}"] = True
+    sub['JobBatchName'] = f"{JOB_PREFIX}-%s" % (jdl_file.strip('.jdl').replace('/', '-'))
+    sub['TransferExecutable'] = False
+    sub['Executable'] = '/usr/bin/bash'
+    # Escaped double quotes trigger "new" argument passing approach, single quotes actually form a single argument.
+    sub['Arguments'] = "\"-c 'while true; do sleep 300; done'\""
+    #sub["+MaxRuntimeHours"] = '1'
     return sub
 
 
-def check_running_jobs(job_name, schedd):
-    # query local schedd for the needed ClassAds
-    query = schedd.query(projection=["JobBatchName", JOB_TYPE_NAME])
-    job_name_found = False
-    job_type_found = False
-    for job in query:
-        # check if job_name already exists for running jobs
-        if "JobBatchName" in job.keys():
-            job_name_found = True if job_name == job.lookup("JobBatchName") else False
-        if JOB_TYPE_NAME in job.keys():
-            job_type_found = True if job.lookup(JOB_TYPE_NAME) is True else False
-        if job_name_found and job_type_found:
-            return True
-    return False
+def check_queued_jobs(job_name, schedd):
+    """
+    Query local schedd for the needed ClassAds, filter out jobs with matching BatchName, type flag, and running / idle,
+    return the ClusterId.
+    """
+    # Filter by JobBatchName, type, and JobStatus (running or idle).
+    query = schedd.query(constraint=f"JobBatchName == \"{job_name}\" && {JOB_TYPE_NAME} is True && (JobStatus == 1 || JobStatus == 2)",
+                         projection=["JobBatchName", JOB_TYPE_NAME, 'ClusterId'])
+    num_jobs = len(query)
+    if num_jobs > 0:
+        if num_jobs > 1:
+            print(f"Warning: More than one matching job running / idle ({num_jobs} jobs), how did you do this?")
+        return query[0]
+    return None
 
 
 def submit_job(sub):
+    """
+    Check if a matching job is already submitted and if not, submit a new one.
+    Returns the ClusterId.
+    """
     schedd = htcondor.Schedd()
-    job_name = sub['batch-name']
-    job_name = 'Rocky9_interactive'
+    job_name = sub['JobBatchName']
     # check if a job with this name is already running
-    job_is_running = check_running_jobs(job_name, schedd)
-    # submit job
-    if job_is_running is True:
-        print('You already have a job running. We will not submit a new but rather connect to the existing job.')
+    queued_job = check_queued_jobs(job_name, schedd)
+    # return a submitted job
+    if queued_job is not None:
+        print('You already have a job queued / running. We will not submit a new job but rather connect to the existing job.')
+        return queued_job['ClusterId']
     else:
-        print('Submitting job...')
+        print('Submitting new job...')
+        return schedd.submit(sub).cluster()
+
+
+def poll_job_running(cluster_id, max_wait=120):
+    """
+    Poll for the max_wait time until the cluster_id job is running.
+    Returns True if this worked out well, and False if something strange happened.
+    """
+    schedd = htcondor.Schedd()
+    for i in range(0, max_wait):
+      query = schedd.query(constraint=f"ClusterId == {cluster_id}", projection=['JobStatus'])
+      if len(query) == 0:
+          print(f"Error: Job with cluster {cluster_id} not in the queue anymore, giving up!")
+          return False
+      job_status = htcondor.JobStatus(query[0]['JobStatus'])
+      if job_status == htcondor.JobStatus.IDLE:
+          print(f"Waiting for job to start ({i}/{max_wait} s)...")
+          time.sleep(1)
+          continue
+      elif job_status == htcondor.JobStatus.RUNNING:
+          return True
+      else:
+          print(f"Job with cluster {cluster_id} has bad status {job_status}, bailing out!")
+          return False
+    print(f"Ttmeout, job did not start within {max_wait} seconds, exiting now (job remains in queue!).")
+
+
+def help():
+    print("VSCode SSH editing helper")
+    print(f"usage: {sys.argv[0]} <SSH arguments> JDL=path_to_jdl_file <remote commands>")
+
+
+def handle_args(argv):
+    """
+    Manual argument parsing, required as it is necessary to emulate SSH
+    with the flags expected by VSCode (taking positional arguments into account to split arguments
+    in some cases).
+    """
+    if len(argv) == 0:
+        help()
+
+    # Hack for VSCode, it expects "ssh -V" to work.
+    if len(argv) > 0 and argv[0] == '-V':
+        proc = subprocess.Popen(['ssh','-V'])
+        proc.wait()
+        sys.exit(proc.returncode)
+
+    # Important: only handle args not to be handled by SSH, as we emulate SSH.
+    # Manual argument parsing is needed, as we rely on an optional positional JDL argument
+    # and need to treat preceeding and successding tokens differently.
+    jdl_found = False
+    ssh_args = []
+    jdl_file = ''
+    remote_commands = []
+    for arg in argv:
+        if arg in ['-h', '--help']:
+            help()
+            sys.exit(0)
+        if arg.startswith('JDL:'):
+            if jdl_found:
+                print("More than one JDL: parameter found, exiting!")
+                sys.exit(1)
+            jdl_found = True
+            jdl_file = arg[4:]
+        else:
+            if jdl_found:
+                remote_commands += [arg]
+            else:
+                ssh_args += [arg]
+    return ssh_args, jdl_file, remote_commands
+
+
+# Global variables, accessed by two threads, used for shell-readiness state machine.
+# "main_shell" relates to the submitted interactive shell, "vscode_shell" to the tty-less bash for vscode.
+main_shell_ready = False
+vscode_shell_ready = False
+
+def wrap_input(proc, stdin):
+    """
+    Input wrapper thread for subprocess "proc", stdin is fed to it with special buffering
+    and after some preparatory steps.
+    """
+    global main_shell_ready
+    global vscode_shell_ready
+    # Wait until the interactive prompt is there.
+    for i in range(0, 600):
+        if main_shell_ready:
+            break
+        time.sleep(0.1)
+    if not main_shell_ready:
+        print("Did not get an interactive shell, exiting here!")
+        sys.exit(1)
+    # Disable echoing, confuses VSCode, it expects a shell without TTY.
+    proc.stdin.write(b'stty -echo\n')
+    # Explicitly launch a shell without TTY by throwing a pipe in its cogwheels.
+    # This is the "vscode_shell".
+    proc.stdin.write(b'cat /dev/stdin | bash\n')
+    proc.stdin.flush()
+    # Need to rest until the no-tty-bash is fully started up and handles stdin
+    # before forwarding any real input.
+    # Test this by pushing in a command,
+    # stdout wrapper will check for the echo.
+    for i in range(0, 600):
+        proc.stdin.write(b'echo "VSCode_SHELL_READY"\n')
+        proc.stdin.flush()
+        if vscode_shell_ready:
+            break
+        time.sleep(0.1)
+    if not vscode_shell_ready:
+        print("Did not get VSCode shell, exiting here!")
+        sys.exit(1)
+    # Finally, start forwarding the buffered stdin.
+    while True:
+        if proc.poll() is not None:
+            print("condor_ssh_to_job exited, terminating input wrapper...")
+            return
+        # Use "select" to cheaply wait for new input, then read1 which only blocks until some bytes are there.
+        stuffthere, _, _ = select.select([stdin], [], [], 0.1)
+        if stuffthere:
+            iput = stdin.buffer.read1()
+            # If select and read1 returned but 0 bytes are there, EOF was hit.
+            if len(iput) == 0:
+                print("stdin closed, terminating stdin wrapper")
+                return
+            proc.stdin.write(iput)
+            proc.stdin.flush()
+
+
+def wrap_output(proc, stdout):
+    """
+    Input wrapper thread for subprocess "proc", stdin is fed to it with special buffering
+    and after some preparatory steps.
+    """
+    main_shell_almost_ready = False
+    global main_shell_ready
+    global vscode_shell_ready
+    while True:
+        if proc.poll() is not None:
+            print("condor_ssh_to_job exited, terminating output wrapper...")
+            return
+        # Use "select" to cheaply wait for new output, then read1 which only blocks until some bytes are there.
+        stuffthere, _, _ = select.select([proc.stdout], [], [], 0.1)
+        if stuffthere:
+            oput = proc.stdout.read1()
+            # State machine: main_shell_almost_ready => main_shell_ready => vscode_shell_ready,
+            # so finally this will be an almost no-op.
+            if not vscode_shell_ready:
+                if not main_shell_ready:
+                    # "almost ready" if pre-shell echo has been seen.
+                    if not main_shell_almost_ready:
+                        if b'You requested ' in oput:
+                            main_shell_almost_ready = True
+                    # "ready" if prompt is found afterwards. Note this might be found in the same buffered stdout read.
+                    if main_shell_almost_ready:
+                        if b'@' in oput:
+                            main_shell_ready = True
+                # Finally if VSCode_SHELL_READY is seen, all is ready (see input wrapper).
+                # Note this might be found in the same buffered stdout read.
+                if b'VSCode_SHELL_READY' in oput:
+                    vscode_shell_ready = True
+            stdout.buffer.write(oput)
+            stdout.flush()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-f", "--file", required=True, help = "Path to jdl file")
+    ssh_args, jdl_file, remote_commands = handle_args(sys.argv[1:])
 
-    args = parser.parse_args()
+    # Expand user components such as '~' in JDL path.
+    jdl_file = os.path.expanduser(jdl_file)
 
-    # get Submit object
-    sub = prepare_job(args)
-    # submit job
-    submit_job(sub)
+    # Get Submit object
+    sub = prepare_job(jdl_file)
+    # Submit job
+    job_cluster = submit_job(sub)
+    job_running = poll_job_running(job_cluster)
+    if not job_running:
+        print("Something went wrong starting the job, exiting here!")
+        sys.exit(1)
 
+    # Just drop all "remote_commands" for now, VSCode usually starts bash, but sending any remote command
+    # disables the "enter the container" feature in /usr/libexec/condor/condor_ssh_to_job_shell_setup .
+    #if remote_commands == ['bash']:
+    #    remote_commands = []
+    #ssh_to_job_args = ['-auto-retry', '-ssh', ' '.join(['ssh', '-S', 'none']+ssh_args), str(job_cluster), ' '.join(remote_commands)]
+    ssh_to_job_args = ['-auto-retry', '-ssh', ' '.join(['ssh', '-S', 'none']+ssh_args), str(job_cluster)]
+
+    # Start condor_ssh_to_job as subprocess, and wrap stdin and stdout.
+    proc = subprocess.Popen(['condor_ssh_to_job'] + ssh_to_job_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    stdin_wrapper_thread = threading.Thread(target=wrap_input, args=(proc,sys.stdin,))
+    stdin_wrapper_thread.start()
+    stdout_wrapper_thread = threading.Thread(target=wrap_output, args=(proc,sys.stdout,))
+    stdout_wrapper_thread.start()
+
+    # Block until process is terminated, then pass through exit code.
+    while proc.poll() is None:
+         time.sleep(0.1)
+    sys.exit(proc.returncode)
