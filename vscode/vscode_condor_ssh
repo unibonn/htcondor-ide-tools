@@ -143,8 +143,8 @@ def handle_args(argv):
 
 
 # Global variables, accessed by two threads, used for shell-readiness state machine.
-# "main_shell" relates to the submitted interactive shell, "vscode_shell" to the tty-less bash for vscode.
-main_shell_ready = False
+# "interactive_shell" relates to the submitted interactive shell, "vscode_shell" to the tty-less bash for vscode.
+interactive_shell_ready = False
 vscode_shell_ready = False
 
 def wrap_input(proc, stdin):
@@ -152,14 +152,18 @@ def wrap_input(proc, stdin):
     Input wrapper thread for subprocess "proc", stdin is fed to it with special buffering
     and after some preparatory steps.
     """
-    global main_shell_ready
+    global interactive_shell_ready
     global vscode_shell_ready
     # Wait until the interactive prompt is there.
+    # Test this by injecting an echo command which requires interpretation by the shell,
+    # which is waited for in the wrap_stdout handler. This also works if stdin echoing is still active.
     for i in range(0, 600):
-        if main_shell_ready:
+        proc.stdin.write(b'echo "INTERACTIVE$(echo _)SHELL_READY"\n')
+        proc.stdin.flush()
+        if interactive_shell_ready:
             break
         time.sleep(0.1)
-    if not main_shell_ready:
+    if not interactive_shell_ready:
         print("Did not get an interactive shell, exiting here!")
         sys.exit(1)
     # Disable echoing, confuses VSCode, it expects a shell without TTY.
@@ -170,10 +174,9 @@ def wrap_input(proc, stdin):
     proc.stdin.flush()
     # Need to rest until the no-tty-bash is fully started up and handles stdin
     # before forwarding any real input.
-    # Test this by pushing in a command,
-    # stdout wrapper will check for the echo.
+    # Test this by pushing in a command, stdout wrapper will check for the echo.
     for i in range(0, 600):
-        proc.stdin.write(b'echo "VSCode_SHELL_READY"\n')
+        proc.stdin.write(b'echo "VSCode$(echo _)SHELL_READY"\n')
         proc.stdin.flush()
         if vscode_shell_ready:
             break
@@ -203,8 +206,7 @@ def wrap_output(proc, stdout):
     Input wrapper thread for subprocess "proc", stdin is fed to it with special buffering
     and after some preparatory steps.
     """
-    main_shell_almost_ready = False
-    global main_shell_ready
+    global interactive_shell_ready
     global vscode_shell_ready
     while True:
         if proc.poll() is not None:
@@ -213,25 +215,28 @@ def wrap_output(proc, stdout):
         # Use "select" to cheaply wait for new output, then read1 which only blocks until some bytes are there.
         stuffthere, _, _ = select.select([proc.stdout], [], [], 0.1)
         if stuffthere:
+            purge_oput = False
             oput = proc.stdout.read1()
-            # State machine: main_shell_almost_ready => main_shell_ready => vscode_shell_ready,
+            # State machine: interactive_shell_ready => vscode_shell_ready,
             # so finally this will be an almost no-op.
             if not vscode_shell_ready:
-                if not main_shell_ready:
-                    # "almost ready" if pre-shell echo has been seen.
-                    if not main_shell_almost_ready:
-                        if b'You requested ' in oput:
-                            main_shell_almost_ready = True
-                    # "ready" if prompt is found afterwards. Note this might be found in the same buffered stdout read.
-                    if main_shell_almost_ready:
-                        if b'@' in oput:
-                            main_shell_ready = True
+                if not interactive_shell_ready:
+                    if b'INTERACTIVE_SHELL_READY' in oput:
+                        interactive_shell_ready = True
+                        purge_oput = True
                 # Finally if VSCode_SHELL_READY is seen, all is ready (see input wrapper).
                 # Note this might be found in the same buffered stdout read.
                 if b'VSCode_SHELL_READY' in oput:
                     vscode_shell_ready = True
-            stdout.buffer.write(oput)
-            stdout.flush()
+                    purge_oput = True
+                # Purge oput on state change, as no actual oput will have arrived (it's gated by the readiness variables).
+                if purge_oput:
+                    continue
+            # Only echo actual oput if everything is ready.
+            # Note "else" would be wrong here, as variable state may be changed above inside the condition.
+            if vscode_shell_ready:
+                stdout.buffer.write(oput)
+                stdout.flush()
 
 if __name__ == "__main__":
     ssh_args, jdl_file, remote_commands = handle_args(sys.argv[1:])
