@@ -23,7 +23,7 @@ def prepare_job(jdl_file):
     test_f = None
     if not os.path.isfile(jdl_file):
         print('This cannot be! Where is my file?!')
-        sys.exit(f"Job file {jdl_file} not found, exiting...")
+        sys.exit(f"Job file \"{jdl_file}\" not found, exiting...")
     with open(jdl_file, 'r') as f:
         test_f = f.read()
 
@@ -139,6 +139,11 @@ def handle_args(argv):
                 remote_commands += [arg]
             else:
                 ssh_args += [arg]
+    if not jdl_found:
+        print("You must enter a hostname such as \"JDL:~/JDLs/VSCode.jdl\", did not find the string \"JDL:\" in the list of arguments:")
+        print(argv)
+        print("Exiting now!")
+        sys.exit(1)
     return ssh_args, jdl_file, remote_commands
 
 
