@@ -28,7 +28,13 @@ def prepare_job(jdl_file):
         test_f = f.read()
 
     # convert to Submit object
-    sub = htcondor.Submit(test_f)
+    try:
+        sub = htcondor.Submit(test_f)
+    except Exception as exc:
+        print(f"Encountered error parsing JDL file \"{jdl_file}\", traceback follows below.")
+        print("To get a more detailed error message, you may try the following command:")
+        print(f"condor_submit {jdl_file} -dry-run -")
+        raise(exc)
     sub[f"+{JOB_TYPE_NAME}"] = True
     sub['JobBatchName'] = f"{JOB_PREFIX}-%s" % (jdl_file.strip('.jdl').replace('/', '-'))
     sub['TransferExecutable'] = False
