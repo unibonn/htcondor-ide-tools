@@ -14,7 +14,17 @@ It requires VS Code to be executed from an Access Point, and the HTCondor Python
 
 The usage instructions assume that the mentioned script is placed in the path.
 
-### Usage
+### Usage (admin point of view)
+From the admin perspective, it might be of interest to apply special policies to IDE jobs, i.e. route them to dedicated / reserved resources, apply runtime limits etc. To ease this, the provided script sets a ClassAd attribute `EditorJob` for all submitted jobs (can be changed at the top of the script).
+
+You may for example apply a policy such as:
+```
+RemoveEditorJobWallTime = ( (EditorJob =?= True) && ( RemoteWallClockTime > 1 * 24 * 60 * 60 ) )
+SYSTEM_PERIODIC_REMOVE = $(SYSTEM_PERIODIC_REMOVE) || $(RemoveEditorJobWallTime)
+```
+on the access points to limit the maximum wall clock time used by the job to 24 hours, or have slots dedicated to such jobs on your execute points. You may also want to set an appropriate `SUBMIT_REQUIREMENT`.
+
+### Usage (user point of view)
 1. Make sure you have the `Remote SSH`-Plugin installed (full name: `ms-vscode-remote.remote-ssh`).
 2. You need to adapt a few configurations. Click on the "gear" button in the bottom left corner to edit your settings. Then search for `ssh` and adapt the following options:
    ```
